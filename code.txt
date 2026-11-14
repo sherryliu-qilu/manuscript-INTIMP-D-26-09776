@@ -1,0 +1,294 @@
+# ---- 0. Packages and paths ----
+required_cran <- c("Seurat", "SeuratObject", "ggplot2", "dplyr", "tidyr", "patchwork", "Matrix")
+missing_cran <- required_cran[!vapply(required_cran, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_cran)) stop("Install CRAN packages first: ", paste(missing_cran, collapse = ", "))
+if (!requireNamespace("scDblFinder", quietly = TRUE)) {
+  stop("Install scDblFinder first: BiocManager::install('scDblFinder')")
+}
+if (!requireNamespace("SingleCellExperiment", quietly = TRUE)) {
+  stop("Install SingleCellExperiment first: BiocManager::install('SingleCellExperiment')")
+}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+  library(scDblFinder)
+  library(SingleCellExperiment)
+})
+
+base_dir <- "/mnt/DATA/home/mxh181102/GSE184880_RAW"
+out_dir <- file.path(base_dir, "Results_7patients_doublet_removed")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+sample_info <- data.frame(
+  GSM = paste0("GSM", 5599225:5599231),
+  Patient = paste0("Cancer", 1:7),
+  FIGO = c("IIIB", "IIB", "IC2", "IC2", "IIB", "IIIC", "IC2"),
+  Stage = c("III", "II", "I", "I", "II", "III", "I")
+)
+write.csv(sample_info, file.path(out_dir, "sample_metadata.csv"), row.names = FALSE)
+
+# ---- 1. Read 10x-like mtx / genes / barcodes, one sample at a time ----
+read_one_sample <- function(gsm, patient, figo, stage) {
+  prefix <- file.path(base_dir, paste0(gsm, "_", patient))
+  mtx_path <- paste0(prefix, ".matrix.mtx.gz")
+  gene_path <- paste0(prefix, ".genes.tsv.gz")
+  barcode_path <- paste0(prefix, ".barcodes.tsv.gz")
+  if (!all(file.exists(c(mtx_path, gene_path, barcode_path)))) {
+    stop("Missing input file(s) for ", patient, ": ", prefix)
+  }
+  counts <- Matrix::readMM(mtx_path)
+  genes <- read.delim(gzfile(gene_path), header = FALSE, sep = "\t", quote = "", check.names = FALSE)
+  barcodes <- read.delim(gzfile(barcode_path), header = FALSE, sep = "\t", quote = "", check.names = FALSE)
+  if (nrow(counts) != nrow(genes) || ncol(counts) != nrow(barcodes)) {
+    stop("Dimension mismatch in ", patient)
+  }
+  # In 10x gene files, column 2 is generally the gene symbol.
+  gene_names <- if (ncol(genes) >= 2) as.character(genes[[2]]) else as.character(genes[[1]])
+  rownames(counts) <- make.unique(gene_names)
+  colnames(counts) <- paste0(patient, "_", barcodes[[1]])
+  counts <- as(counts, "dgCMatrix")
+  obj <- CreateSeuratObject(counts = counts, project = patient, min.cells = 0, min.features = 0)
+  obj$Patient <- patient
+  obj$GSM <- gsm
+  obj$FIGO <- figo
+  obj$Stage <- stage
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj
+}
+
+seurat_list <- lapply(seq_len(nrow(sample_info)), function(i) {
+  x <- sample_info[i, ]
+  read_one_sample(x$GSM, x$Patient, x$FIGO, x$Stage)
+})
+names(seurat_list) <- sample_info$Patient
+# ---- 2. QC (previously used thresholds) ----
+qc_before <- bind_rows(lapply(names(seurat_list), function(s) {
+  x <- seurat_list[[s]]
+  data.frame(Patient = s, raw_cells = ncol(x))
+}))
+seurat_qc <- lapply(seurat_list, function(obj) {
+  subset(obj, subset = nFeature_RNA >= 300 & nFeature_RNA <= 7500 &
+           nCount_RNA >= 500 & percent.mt < 20)
+})
+qc_after <- bind_rows(lapply(names(seurat_qc), function(s) {
+  data.frame(Patient = s, cells_after_QC = ncol(seurat_qc[[s]]))
+}))
+qc_summary <- left_join(qc_before, qc_after, by = "Patient")
+write.csv(qc_summary, file.path(out_dir, "QC_summary.csv"), row.names = FALSE)
+
+# ---- 3. scDblFinder: ACTUAL doublet detection per sample ----
+# Run independently per library/sample. The expected doublet rate is estimated
+# by scDblFinder; do not substitute invented removal counts.
+doublet_results <- vector("list", length(seurat_qc))
+names(doublet_results) <- names(seurat_qc)
+seurat_singlets <- vector("list", length(seurat_qc))
+names(seurat_singlets) <- names(seurat_qc)
+for (s in names(seurat_qc)) {
+  message("Running scDblFinder for ", s)
+  obj <- seurat_qc[[s]]
+  sce <- as.SingleCellExperiment(obj, assay = "RNA")
+  sce <- scDblFinder::scDblFinder(sce, verbose = FALSE)
+  obj$scDblFinder.score <- as.numeric(colData(sce)$scDblFinder.score)
+  obj$scDblFinder.class <- as.character(colData(sce)$scDblFinder.class)
+  doublet_results[[s]] <- data.frame(
+    Patient = s,
+    Cell_Barcode = colnames(obj),
+    scDblFinder_score = obj$scDblFinder.score,
+    scDblFinder_class = obj$scDblFinder.class,
+    stringsAsFactors = FALSE
+  )
+  seurat_singlets[[s]] <- subset(obj, subset = scDblFinder.class == "singlet")
+  if (ncol(seurat_singlets[[s]]) == 0) stop("No singlets left in ", s)
+}
+doublet_calls <- bind_rows(doublet_results)
+write.csv(doublet_calls, file.path(out_dir, "scDblFinder_per_cell_calls.csv"), row.names = FALSE)
+doublet_summary <- doublet_calls %>%
+  count(Patient, scDblFinder_class, name = "n") %>%
+  tidyr::pivot_wider(names_from = scDblFinder_class, values_from = n, values_fill = 0)
+write.csv(doublet_summary, file.path(out_dir, "scDblFinder_summary.csv"), row.names = FALSE)
+
+# ---- 4. Merge singlets, normalize, cluster and t-SNE ----
+ovarian <- merge(seurat_singlets[[1]], y = seurat_singlets[-1], project = "GSE184880")
+DefaultAssay(ovarian) <- "RNA"
+if (inherits(ovarian[["RNA"]], "Assay5")) ovarian <- JoinLayers(ovarian, assay = "RNA")
+ovarian <- NormalizeData(ovarian, normalization.method = "LogNormalize", scale.factor = 10000, verbose = FALSE)
+ovarian <- FindVariableFeatures(ovarian, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+ovarian <- ScaleData(ovarian, features = VariableFeatures(ovarian), verbose = FALSE)
+ovarian <- RunPCA(ovarian, features = VariableFeatures(ovarian), npcs = 30, verbose = FALSE)
+ovarian <- FindNeighbors(ovarian, dims = 1:20, verbose = FALSE)
+ovarian <- FindClusters(ovarian, resolution = 0.2, random.seed = 1234, verbose = FALSE)
+ovarian <- RunTSNE(ovarian, dims = 1:20, reduction = "pca", seed.use = 1234, check_duplicates = FALSE)
+ovarian$Stage <- factor(as.character(ovarian$Stage), levels = c("I", "II", "III"))
+
+saveRDS(ovarian, file.path(out_dir, "GSE184880_post_doublet_unannotated.rds"))
+write.csv(as.data.frame(table(ovarian$Patient, ovarian$seurat_clusters)),
+          file.path(out_dir, "patient_cluster_counts.csv"), row.names = FALSE)
+ggsave(file.path(out_dir, "tSNE_clusters.pdf"),
+       DimPlot(ovarian, reduction = "tsne", label = TRUE, repel = TRUE, pt.size = 0.2), width = 8, height = 6)
+ggsave(file.path(out_dir, "tSNE_by_patient.pdf"),
+       DimPlot(ovarian, reduction = "tsne", group.by = "Patient", pt.size = 0.2), width = 8, height = 6)
+
+# ---- 5. Cluster markers and annotation checkpoint ----
+Idents(ovarian) <- "seurat_clusters"
+markers <- FindAllMarkers(ovarian, only.pos = TRUE, min.pct = 0.25,
+                          logfc.threshold = 0.25, test.use = "wilcox")
+write.csv(markers, file.path(out_dir, "FindAllMarkers_clusters.csv"), row.names = FALSE)
+marker_genes <- unique(c(
+  "CD3D", "CD3E", "CD8A", "CD8B", "CD4", "IL7R",
+  "NKG7", "GNLY", "KLRD1", "MS4A1", "CD79A", "MZB1", "JCHAIN",
+  "CD68", "CD163", "C1QA", "APOE", "CSF1R", "LYZ", "S100A8", "S100A9",
+  "EPCAM", "KRT8", "KRT18", "PAX8", "COL1A1", "COL1A2", "DCN", "LUM", "FAP", "PDGFRA",
+  "RGS5", "PDGFRB", "MCAM", "NOTCH3", "PECAM1", "VWF", "CDH5", "CLDN5"
+))
+marker_genes <- intersect(marker_genes, rownames(ovarian))
+ggsave(file.path(out_dir, "Marker_DotPlot.pdf"),
+       DotPlot(ovarian, features = marker_genes) + RotatedAxis(), width = 16, height = 7)
+
+# The following annotation was based on PREVIOUS analysis WITHOUT doublet removal.
+# DO NOT apply blindly to newly generated clusters. After inspecting Marker_DotPlot.pdf
+# and FindAllMarkers_clusters.csv, edit the mapping and set verified_annotation <- TRUE.
+celltype_map <- c(
+  "0" = "CD8 T cells", "1" = "Macrophages", "2" = "NK cells",
+  "3" = "Epithelial cells", "4" = "CAFs", "5" = "Plasma cells",
+  "6" = "Epithelial cells", "7" = "CD8 T cells", "8" = "CD4 T cells",
+  "9" = "Epithelial cells", "10" = "Pericytes", "11" = "B cells",
+  "12" = "Endothelial cells", "13" = "Epithelial cells", "14" = "CD8 T cells"
+)
+verified_annotation <- FALSE  # Change to TRUE ONLY after manually validating new cluster markers.
+if (!verified_annotation) {
+  stop("CHECKPOINT: Review Marker_DotPlot.pdf and FindAllMarkers_clusters.csv; update celltype_map, then set verified_annotation <- TRUE and rerun annotation/analysis. Unannotated object has been saved.")
+}
+cluster_ids <- sort(unique(as.character(ovarian$seurat_clusters)))
+if (!setequal(cluster_ids, names(celltype_map))) {
+  stop("celltype_map cluster IDs do not match current clustering; revise the mapping.")
+}
+ovarian$CellType <- unname(celltype_map[as.character(ovarian$seurat_clusters)])
+celltype_order <- c("CD8 T cells", "CD4 T cells", "NK cells", "B cells", "Plasma cells",
+                    "Macrophages", "CAFs", "Pericytes", "Endothelial cells", "Epithelial cells")
+ovarian$CellType <- factor(ovarian$CellType, levels = celltype_order)
+if (anyNA(ovarian$CellType)) stop("Unmapped cell types detected")
+saveRDS(ovarian, file.path(out_dir, "GSE184880_doublet_removed_annotated.rds"))
+ggsave(file.path(out_dir, "tSNE_CellType.pdf"),
+       DimPlot(ovarian, reduction = "tsne", group.by = "CellType", label = TRUE, repel = TRUE, pt.size = 0.2),
+       width = 9, height = 7)
+
+# ---- 6. Cell-type proportions and CD8 fractions ----
+meta <- ovarian@meta.data
+meta$CellType <- as.character(meta$CellType)
+meta$Stage <- factor(as.character(meta$Stage), levels = c("I", "II", "III"))
+celltype_by_patient <- meta %>% count(Patient, Stage, CellType, name = "Cell_count") %>%
+  group_by(Patient, Stage) %>% mutate(Percentage = 100 * Cell_count / sum(Cell_count)) %>% ungroup()
+write.csv(celltype_by_patient, file.path(out_dir, "celltype_proportions_by_patient.csv"), row.names = FALSE)
+celltype_by_stage <- meta %>% count(Stage, CellType, name = "Cell_count") %>%
+  group_by(Stage) %>% mutate(Percentage = 100 * Cell_count / sum(Cell_count)) %>% ungroup()
+write.csv(celltype_by_stage, file.path(out_dir, "celltype_proportions_pooled_by_stage.csv"), row.names = FALSE)
+
+stage_colors <- c("I" = "#00A8B5", "II" = "#F57D79", "III" = "#F4BD46")
+cell_colors <- c(
+  "CD8 T cells" = "#E65A4F", "CD4 T cells" = "#F2A76B", "NK cells" = "#9C83C7",
+  "B cells" = "#76A6D8", "Plasma cells" = "#4F7BA8", "Macrophages" = "#4BAF9F",
+  "CAFs" = "#D4B177", "Pericytes" = "#A8A0BF", "Endothelial cells" = "#83B7AF",
+  "Epithelial cells" = "#BFC9D4"
+)
+cd8_by_stage <- meta %>% group_by(Stage) %>% summarise(
+  Total_cells = n(), CD8_cells = sum(CellType == "CD8 T cells"),
+  CD8_pct = 100 * CD8_cells / Total_cells, .groups = "drop")
+cd8_by_patient <- meta %>% group_by(Patient, Stage) %>% summarise(
+  Total_cells = n(), CD8_cells = sum(CellType == "CD8 T cells"),
+  CD8_pct_all = 100 * CD8_cells / Total_cells, .groups = "drop")
+write.csv(cd8_by_stage, file.path(out_dir, "CD8_pooled_by_stage.csv"), row.names = FALSE)
+write.csv(cd8_by_patient, file.path(out_dir, "CD8_by_patient.csv"), row.names = FALSE)
+
+p_stack <- ggplot(celltype_by_stage, aes(x = Stage, y = Percentage, fill = CellType)) +
+  geom_col(width = 0.65, color = "white", linewidth = 0.2) +
+  geom_text(data = cd8_by_stage, aes(x = Stage, y = 105, label = sprintf("CD8: %.1f%%", CD8_pct)),
+            inherit.aes = FALSE, size = 4, color = "#C74439", fontface = "bold") +
+  scale_fill_manual(values = cell_colors) +
+  scale_y_continuous(limits = c(0, 112), breaks = seq(0, 100, 20), expand = c(0, 0)) +
+  theme_classic(base_size = 13) + labs(x = "FIGO stage", y = "Cell proportion (%)", fill = "Cell type")
+ggsave(file.path(out_dir, "CellType_stacked_3_FIGO_stages.pdf"), p_stack, width = 8, height = 6)
+
+
+# ---- 7. VEGFA: cell-level data, patient x cell type, and t-SNE ----
+if (!"VEGFA" %in% rownames(ovarian)) stop("VEGFA gene not found")
+expr <- GetAssayData(ovarian, assay = "RNA", layer = "data")
+counts <- GetAssayData(ovarian, assay = "RNA", layer = "counts")
+stopifnot(identical(rownames(meta), colnames(ovarian)))
+meta$VEGFA_expr <- as.numeric(expr["VEGFA", rownames(meta)])
+meta$VEGFA_positive <- as.numeric(counts["VEGFA", rownames(meta)] > 0)
+vegfa_cells <- data.frame(
+  Cell_Barcode = rownames(meta), Patient = meta$Patient, Stage = meta$Stage,
+  CellType = meta$CellType, VEGFA_expr = meta$VEGFA_expr,
+  VEGFA_positive = as.logical(meta$VEGFA_positive)
+)
+write.csv(vegfa_cells, file.path(out_dir, "VEGFA_all_cells_expression.csv"), row.names = FALSE)
+vegfa_by_patient_celltype <- meta %>% group_by(Patient, Stage, CellType) %>% summarise(
+  Cell_number = n(), Mean_VEGFA = mean(VEGFA_expr), Median_VEGFA = median(VEGFA_expr),
+  VEGFA_positive_pct = 100 * mean(VEGFA_positive), .groups = "drop")
+write.csv(vegfa_by_patient_celltype,
+          file.path(out_dir, "VEGFA_each_patient_each_celltype.csv"), row.names = FALSE)
+vegfa_wide <- vegfa_by_patient_celltype %>%
+  select(Patient, Stage, CellType, Mean_VEGFA) %>%
+  tidyr::pivot_wider(names_from = CellType, values_from = Mean_VEGFA)
+write.csv(vegfa_wide, file.path(out_dir, "VEGFA_expression_matrix_7patients.csv"), row.names = FALSE, na = "")
+
+p_vegfa_tsne <- FeaturePlot(ovarian, features = "VEGFA", reduction = "tsne",
+                            split.by = "Stage", keep.scale = "all", order = TRUE,
+                            pt.size = 0.2, ncol = 3)
+ggsave(file.path(out_dir, "VEGFA_tSNE_3_stages.pdf"), p_vegfa_tsne, width = 15, height = 5)
+
+# ---- 8. Epithelial VEGFA by patient, one-way ANOVA, Tukey HSD ----
+vegfa_epi <- vegfa_by_patient_celltype %>% filter(CellType == "Epithelial cells")
+write.csv(vegfa_epi, file.path(out_dir, "VEGFA_epithelial_by_patient.csv"), row.names = FALSE)
+if (length(unique(vegfa_epi$Patient)) != 7L) {
+  warning("Not all seven patients have epithelial cells; review annotations before statistical tests")
+}
+vegfa_epi$Stage <- factor(as.character(vegfa_epi$Stage), levels = c("I", "II", "III"))
+anova_result <- aov(Mean_VEGFA ~ Stage, data = vegfa_epi)
+anova_p <- summary(anova_result)[[1]][["Pr(>F)"]][1]
+tukey_result <- TukeyHSD(anova_result)
+write.csv(as.data.frame(summary(anova_result)[[1]]),
+          file.path(out_dir, "VEGFA_epithelial_ANOVA.csv"))
+write.csv(as.data.frame(tukey_result$Stage),
+          file.path(out_dir, "VEGFA_epithelial_TukeyHSD.csv"))
+
+vegfa_summary <- vegfa_epi %>% group_by(Stage) %>% summarise(
+  Mean = mean(Mean_VEGFA), SD = sd(Mean_VEGFA), n = n(), .groups = "drop")
+y_max <- max(vegfa_summary$Mean + vegfa_summary$SD, vegfa_epi$Mean_VEGFA, na.rm = TRUE)
+if (!is.finite(y_max) || y_max <= 0) y_max <- 1
+p_label <- if (is.na(anova_p)) "ANOVA P = NA" else if (anova_p < 0.001) {
+  "ANOVA P < 0.001"
+} else sprintf("ANOVA P = %.3f", anova_p)
+stage_x <- c("I" = 1, "II" = 1.55, "III" = 2.10)
+vegfa_summary$x <- unname(stage_x[as.character(vegfa_summary$Stage)])
+vegfa_epi$x <- unname(stage_x[as.character(vegfa_epi$Stage)])
+p_vegfa_bar <- ggplot(vegfa_summary, aes(x = x, y = Mean, fill = Stage)) +
+  geom_col(width = 0.38) +
+  geom_errorbar(aes(ymin = pmax(0, Mean - SD), ymax = Mean + SD), width = 0.08, linewidth = 0.5) +
+  geom_point(data = vegfa_epi, aes(x = x, y = Mean_VEGFA), inherit.aes = FALSE,
+             position = position_jitter(width = 0.025, height = 0, seed = 1234), size = 1.8) +
+  annotate("text", x = 1.55, y = y_max * 1.16, label = p_label, size = 3.5) +
+  scale_fill_manual(values = stage_colors) +
+  scale_x_continuous(breaks = unname(stage_x), labels = names(stage_x), expand = expansion(add = 0.25)) +
+  scale_y_continuous(limits = c(0, y_max * 1.25), expand = expansion(mult = c(0, 0))) +
+  theme_classic(base_size = 12) + theme(legend.position = "none") +
+  labs(x = NULL, y = "Mean VEGFA expression in epithelial cells")
+ggsave(file.path(out_dir, "VEGFA_epithelial_ANOVA_bar_slim.pdf"), p_vegfa_bar,
+       width = 2.6, height = 4.2)
+
+# ---- 9. VEGFA/CD8 exploratory patient-level association ----
+patient_vegfa <- meta %>% group_by(Patient, Stage) %>% summarise(
+  Mean_VEGFA_all = mean(VEGFA_expr), .groups = "drop")
+patient_summary <- cd8_by_patient %>% left_join(patient_vegfa, by = c("Patient", "Stage")) %>%
+  left_join(vegfa_epi %>% select(Patient, Stage, Mean_VEGFA_epi = Mean_VEGFA),
+            by = c("Patient", "Stage"))
+write.csv(patient_summary, file.path(out_dir, "Patient_VEGFA_CD8_summary.csv"), row.names = FALSE)
+
+# ---- 10. Reproducibility record ----
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+message("Completed analysis. Results: ", out_dir)
+message("IMPORTANT: n = 7 patients; ANOVA assumptions cannot be reliably assessed.")
+message("Pooled stage cell proportions are cell-weighted, not patient-weighted.")
